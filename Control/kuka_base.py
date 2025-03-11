@@ -92,16 +92,12 @@ class KukaBase:
     
     ### GRIPPER CONTROL ###
     def change_gripper_mode(self, mode: str):
-        if not self.use_gripper:
-            return False
         
         assert isinstance(mode, str) and mode in {'o', 'w', 'p', 'b', 's', 'r'}
         resp = self.gripper_change_mode_fn(mode)
         return resp
 
     def move_gripper(self, deg: int):
-        if not self.use_gripper:
-            return False
         
         deg = max(min(deg, 250), 0)
         resp = self.gripper_move_fn(deg)
@@ -128,8 +124,8 @@ class KukaBase:
                 rospy.wait_for_message("/iiwa/state/DestinationReached", Time, timeout=timeout)
             except:
                 self.publish_target_pose(self.current_eef_pose, timeout=-1)
-                print("Command timeout! Stopped!")
-                exit(0)
+                # print("Command timeout! Stopped!")
+                # exit(0)
 
         return True
         
@@ -166,6 +162,8 @@ if __name__ == "__main__":
     # reached_pose = agent.current_eef_pose
     for pose in pose_traj:
         agent.move_eef(pose, timeout=20)
+        agent.move_gripper(245)
+        agent.change_gripper_mode("p")
 
     # agent.move_eef(target_pose, timeout=90)
     # agent.move_fingertip(target_pose, timeout=25)

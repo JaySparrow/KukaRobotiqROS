@@ -40,8 +40,8 @@ class KukaWrenchInsertEnv:
             self.cfg["close_error_thresh"] = 0.08 # 0.05
 
         ## Pose Subscribers ##
-        rospy.Subscriber("/pose_tracker/nut4", PoseStamped, self.nut_callback)
-        rospy.Subscriber("/pose_tracker/wrench4_head", PoseStamped, self.wrench_head_callback)
+        rospy.Subscriber("/pose_tracker/nut1", PoseStamped, self.nut_callback)
+        rospy.Subscriber("/pose_tracker/wrench1_head", PoseStamped, self.wrench_head_callback)
         # rospy.Subscriber("/pose_tracker/wrench5", PoseStamped, self.wrench_callback)
         self.nut_pose = None
         self.wrench_head_pose = None
@@ -72,8 +72,8 @@ class KukaWrenchInsertEnv:
 
         # eef force torque threshold
         # self.eef_delta_force_torque_thresh = torch.tensor([[4, 4, 3.0, 0.3, 0.3, 0.4]]) # (1, 6)
-        self.eef_delta_force_torque_thresh = torch.tensor([[3, 3, 3, 0.3, 0.3, 0.4]]) # (1, 6)
-        # self.eef_delta_force_torque_thresh = torch.tensor([[1.5, 3, 3, 0.3, 0.3, 0.4]]) # (1, 6)
+        # self.eef_delta_force_torque_thresh = torch.tensor([[3, 3, 3, 0.3, 0.3, 0.4]]) # (1, 6)
+        self.eef_delta_force_torque_thresh = torch.tensor([[1.5, 3, 3, 0.3, 0.3, 0.4]]) # (1, 6)
 
         ## keypoints
         self.keypoint_offsets_wrench_head = (
@@ -107,32 +107,32 @@ class KukaWrenchInsertEnv:
         print(f"Subscribers are not responding within {seconds} seconds!")
         exit(0)
 
-    def reset(self, reset_progress: bool=True):
+    def reset(self):
         ## Reset reference force torque
         robot_state = self.robot.get_robot_state()
         self.reference_eef_force_torque = torch.from_numpy(robot_state["eef_force_torque"][None, :]) # (1, 6)
         
-        ## Reset nut standard transform
-        nut_quat = torch.from_numpy(self.nut_pose[None, 3:7])
-        standard_nut_quat = env_utils.calc_feasible_nut_quaternions(nut_quat)[:, 8:12] # (1, 4)
-        self.standard_nut_quat_local = torch_jit_utils.quat_mul(torch_jit_utils.quat_conjugate(nut_quat), standard_nut_quat)
+        # ## Reset nut standard transform
+        # nut_quat = torch.from_numpy(self.nut_pose[None, 3:7])
+        # standard_nut_quat = env_utils.calc_feasible_nut_quaternions(nut_quat)[:, 8:12] # (1, 4)
+        # self.standard_nut_quat_local = torch_jit_utils.quat_mul(torch_jit_utils.quat_conjugate(nut_quat), standard_nut_quat)
 
         ## Reset initial pose
         self.move_gripper_to_init_wrench_pose()
 
-        if reset_progress:
-            self.progress = 0
+        self.progress = 0
 
-        # if self.cfg["action_as_object_displacement"]:
-        #     obs = self.compute_object_observations()
-        # else:
-        #     obs = self.compute_observations()
         if self.cfg["observation_type"] == 0:
             obs = self.compute_observations()
         elif self.cfg["observation_type"] == 1:
             obs = self.compute_object_observations()
         else:
             obs = self.compute_ablation_observations()
+
+        self.ctrl_target_fingert_pos = torch.from_numpy(robot_state["fingertip_pose"][None, :3])
+        self.ctrl_target_fingertip_quat = torch.from_numpy(robot_state["fingertip_pose"][None, 3:7])
+
+        self.recorded_poses = {}
         
         return obs
     
@@ -150,6 +150,8 @@ class KukaWrenchInsertEnv:
             obs = self.compute_object_observations()
         else:
             obs = self.compute_ablation_observations()
+
+        self.record_poses()
 
         if update_progress:
             self.progress += 1
@@ -230,14 +232,19 @@ class KukaWrenchInsertEnv:
         )
         fingertip_goal_quat, fingertip_goal_pos = self.wrench_head_to_fingertip(wrench_head_goal_quat, wrench_head_goal_pos)
 
+        def rotate(q):
+            roll, pitch, yaw = torch_jit_utils.get_euler_xyz(q)
+            q = -torch_jit_utils.quat_from_euler_xyz(roll, pitch, (np.pi - yaw) % (2 * np.pi))
+            return q
+
         ## Prepare observation tensors
         delta_pos = fingertip_goal_pos - fingertip_pos
         obs_tensors = [
             arm_dof_pos,
             fingertip_pos,
-            fingertip_quat,
+            rotate(fingertip_quat),
             fingertip_goal_pos,
-            fingertip_goal_quat,
+            rotate(fingertip_goal_quat),
             delta_pos
         ]
         obs_buf = torch.cat(obs_tensors, dim=1) # (1, 24)
@@ -350,6 +357,58 @@ class KukaWrenchInsertEnv:
 
         return obs_buf
     
+    def record_poses(self):
+        if not hasattr(self, "recorded_poses") or not isinstance(self.recorded_poses, dict):
+            self.recorded_poses = {}
+
+        nut_pos, nut_quat = self.get_standard_nut_pose()
+        wrench_head_pos, wrench_head_quat = self.get_wrench_head_pose()
+        
+        wrench_head_target_quat, wrench_head_target_pos = self.fingertip_to_wrench_head(
+            self.ctrl_target_fingertip_quat, self.ctrl_target_fingert_pos)
+        
+        ## Robot state
+        robot_state = self.robot.get_robot_state()
+        fingertip_quat = torch.from_numpy(robot_state["fingertip_pose"][None, 3:7])
+        fingertip_pos = torch.from_numpy(robot_state["fingertip_pose"][None, :3])
+
+        wrench_head_goal_quat, wrench_head_goal_pos = torch_jit_utils.tf_combine(
+            nut_quat,
+            nut_pos,
+            self.wrench_head_goal_quat_local.clone(),
+            self.wrench_head_goal_pos_local.clone()
+        )
+        fingertip_goal_quat, fingertip_goal_pos = self.wrench_head_to_fingertip(wrench_head_goal_quat, wrench_head_goal_pos)
+        
+        ## in robot frame
+        poses_dict = {
+            "wrench_head": torch.cat([wrench_head_pos, wrench_head_quat], dim=-1),
+            "wrench_head_target": torch.cat([wrench_head_target_pos, wrench_head_target_quat], dim=-1),
+            "wrench_head_goal": torch.cat([wrench_head_goal_pos, wrench_head_goal_quat], dim=-1),
+            "fingertip": torch.cat([fingertip_pos, fingertip_quat], dim=-1),
+            "fingertip_target": torch.cat([self.ctrl_target_fingert_pos, self.ctrl_target_fingertip_quat], dim=-1),
+            "fingertip_goal": torch.cat([fingertip_goal_pos, fingertip_goal_quat], dim=-1),
+        }
+
+        def to_socket(pose_in_world):
+            socket_quat_inv, socket_pos_inv = torch_jit_utils.tf_inverse(nut_quat, nut_pos)
+            quat_in_socket, pos_in_socket =  torch_jit_utils.tf_combine(
+                socket_quat_inv, 
+                socket_pos_inv, 
+                pose_in_world[:, 3:], 
+                pose_in_world[:, :3]
+            )
+            return torch.cat([pos_in_socket, quat_in_socket], dim=-1)
+        
+        for key, pose in poses_dict.items():
+            if key not in self.recorded_poses:
+                self.recorded_poses[key] = []
+            # self.recorded_poses[key].append((to_socket(pose)))
+            if "wrench" in key: # in nut's frame
+                self.recorded_poses[key].append(to_socket(pose))
+            elif "fingertip" in key: # in robot base's frame
+                self.recorded_poses[key].append(pose)
+    
     def apply_actions_as_ctrl_targets(self, actions: torch.Tensor, do_scale: bool, regularize_with_force: bool=True):
         """Tensor"""
         actions = torch.clamp(actions, -1.0, 1.0)
@@ -378,9 +437,20 @@ class KukaWrenchInsertEnv:
 
         ## Position
         ## DIRTY PART: Correct for delta actions
-        pos_actions = torch_jit_utils.quat_apply(self.world_to_robot_base[None, 3:7], pos_actions) # (1, 3)
+        # pos_actions = torch_jit_utils.quat_apply(self.world_to_robot_base[None, 3:7], pos_actions) # (1, 3)
 
-        target_fingertip_pos = fingertip_pos + pos_actions
+        target_fingertip_pos = fingertip_pos # + pos_actions
+
+        wrench_head_pos, wrench_head_quat = self.get_wrench_head_pose()
+        nut_pos, nut_quat = self.get_standard_nut_pose()
+        
+        # if wrench_head_pos[:, 2] - nut_pos[:, 2] < 0.018:
+        #     target_fingertip_pos[:, 0] -= pos_actions[:, 0]
+        #     target_fingertip_pos[:, 1] -= pos_actions[:, 1]
+        #     target_fingertip_pos[:, 2] += pos_actions[:, 2]
+        # else: 
+        #     target_fingertip_pos += pos_actions
+        target_fingertip_pos += pos_actions
 
         ## Rotation
         angle = torch.norm(rot_actions, p=2, dim=-1)
@@ -393,16 +463,18 @@ class KukaWrenchInsertEnv:
                 torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
             )
         ## DIRTY PART: Correct for delta actions
-        rot_actions_quat = torch_jit_utils.quat_mul(
-            self.world_to_robot_base[None, 3:7],
-            torch_jit_utils.quat_mul(
-                rot_actions_quat,
-                torch_jit_utils.quat_conjugate(self.world_to_robot_base[None, 3:7])
-            )
-        ) # (1, 4)
+        # rot_actions_quat = torch_jit_utils.quat_mul(
+        #     self.world_to_robot_base[None, 3:7],
+        #     torch_jit_utils.quat_mul(
+        #         rot_actions_quat,
+        #         torch_jit_utils.quat_conjugate(self.world_to_robot_base[None, 3:7])
+        #     )
+        # ) # (1, 4)
         target_fingertip_quat = torch_jit_utils.quat_mul(
             rot_actions_quat, fingertip_quat
         )
+        self.ctrl_target_fingert_pos = target_fingertip_pos.clone()
+        self.ctrl_target_fingertip_quat = target_fingertip_quat.clone()
         
         ## Apply
         target_fingertip_pose = torch.cat([target_fingertip_pos, target_fingertip_quat], axis=-1)
@@ -423,13 +495,17 @@ class KukaWrenchInsertEnv:
         robot_state = self.robot.get_robot_state()
         current_eef_force_torque = torch.from_numpy(robot_state["eef_force_torque"][None, :]) # (1, 6)
 
-        ## Regularize with force
+        ## Regularize with force (directed)
         if regularize_with_force:
-            delta_force_torque = torch.abs(current_eef_force_torque - self.reference_eef_force_torque) # [f_x, f_y, f_z, t_x, t_y, t_z]
-            action_regularizer = (delta_force_torque < self.eef_delta_force_torque_thresh).float()
+            delta_force_torque = current_eef_force_torque - self.reference_eef_force_torque # [f_x, f_y, f_z, t_x, t_y, t_z]
+            action_direction = torch.sign(actions)
+            # positive
+            pos_action_zeroer = torch.logical_and(delta_force_torque > self.eef_delta_force_torque_thresh, action_direction[:, [2, 1, 0, 5, 4, 3]] > 0)
+            # negative
+            neg_action_zeroer = torch.logical_and(delta_force_torque < -self.eef_delta_force_torque_thresh, action_direction[:, [2, 1, 0, 5, 4, 3]] < 0)
+            action_regularizer = 1 - torch.logical_or(pos_action_zeroer, neg_action_zeroer).float()
             action_regularizer = action_regularizer[:, [2, 1, 0, 5, 4, 3]]
             actions = actions * action_regularizer
-            # print(np.nonzero(actions))
 
         pos_actions, rot_actions = actions[:, :3], actions[:, 3:6]
         ## Scale
@@ -459,19 +535,28 @@ class KukaWrenchInsertEnv:
         ## Transform to gripper fingertip's action target
         ctrl_target_fingertip_quat, ctrl_target_fingert_pos = self.wrench_head_to_fingertip(
             ctrl_target_wrench_head_quat, ctrl_target_wrench_head_pos)
+        self.ctrl_target_fingertip_quat = ctrl_target_fingertip_quat.clone()
+        self.ctrl_target_fingert_pos = ctrl_target_fingert_pos.clone()
 
         ## Apply
         ctrl_target_fingertip_pose = torch.cat([ctrl_target_fingert_pos, ctrl_target_fingertip_quat], axis=-1)
         self.robot.move_fingertip(ctrl_target_fingertip_pose.numpy()[0], timeout=5)
 
-    def move_gripper_to_init_wrench_pose(self, timeout: int=60):
+    def get_init_wrench_head_pose(self):
         """Tensor"""
-        ## Env state
-        nut_pos, nut_quat = self.get_standard_nut_pose()
+        ## Reset nut standard transform
+        nut_quat = torch.from_numpy(self.nut_pose[None, 3:7])
+        standard_nut_quat = env_utils.calc_feasible_nut_quaternions(nut_quat)[:, 8:12] # (1, 4)
+        self.standard_nut_quat_local = torch_jit_utils.quat_mul(torch_jit_utils.quat_conjugate(nut_quat), standard_nut_quat)
+        nut_pos = torch.from_numpy(self.nut_pose[None, :3])
+        nut_quat = standard_nut_quat.clone()
 
         ## Compute the fingertip goal pose
         wrench_head_goal_pos_local = self.wrench_head_goal_pos_local.clone()
-        wrench_head_goal_pos_local[:, 2] += 0.018391 + 0.01 # - 0.005
+        # wrench_head_goal_pos_local[:, 2] += 0.018391 + 0.01
+        # wrench_head_goal_pos_local[:, 2] += 0.018391 + 0.006 # industreal
+        wrench_head_goal_pos_local[:, 2] += 0.018391 + 0.002 # industreal
+        # wrench_head_goal_pos_local[:, :2] += (2 * torch.rand((1, 2)) - 0.5) * 0.01
         # wrench head goal pose
         wrench_head_goal_quat, wrench_head_goal_pos = torch_jit_utils.tf_combine(
             nut_quat,
@@ -479,50 +564,104 @@ class KukaWrenchInsertEnv:
             self.wrench_head_goal_quat_local.clone(),
             wrench_head_goal_pos_local
         )
+        return wrench_head_goal_pos, wrench_head_goal_quat
+
+    def move_gripper_to_init_wrench_pose(self, timeout: int=100):
+        """Tensor"""
+        wrench_head_goal_pos, wrench_head_goal_quat = self.get_init_wrench_head_pose()
+
         fingertip_goal_quat, fingertip_goal_pos = self.wrench_head_to_fingertip(wrench_head_goal_quat, wrench_head_goal_pos)
-        # ic("goal", fingertip_goal_pos, fingertip_goal_quat, wrench_head_goal_pos, wrench_head_goal_quat, nut_pos, nut_quat)
+        self.ctrl_target_fingert_pos = fingertip_goal_pos.clone()
+        self.ctrl_target_fingertip_quat = fingertip_goal_quat.clone()
         
         ## Move gripper to the goal pose
         fingertip_goal_pose = torch.cat([fingertip_goal_pos, fingertip_goal_quat], axis=-1)
         self.robot.move_fingertip(fingertip_goal_pose.numpy()[0], timeout=timeout)
 
-    def rotate_wrench_head_on_nut(self, timeout: int=30, z_offset: float=0.0, counter_clockwise: bool=True):
+    def rotate_wrench_head_on_nut(self, timeout: int = 30, z_offset: float = 0.0, counter_clockwise: bool = True):
         total_deg = 65
         delta_deg = 10
 
-        ## next wrench head pose in the current nut frame
+        # Capture the initial nut pose once
+        initial_nut_pos, initial_nut_quat = self.get_standard_nut_pose()
+
+        # Initial wrench head pose relative to the initial nut frame
         wrench_head_goal_pos_local = self.wrench_head_goal_pos_local.clone()
-        wrench_head_goal_pos_local[:, 2] += z_offset
-        # wrench_head_goal_pos_local[:, 2] += 0.018391 + 0.01
-        roll = delta_deg/180 * torch.pi * torch.ones((1, ))
-        if not counter_clockwise:
-            roll *= -1
-        pitch = torch.zeros((1, ))
-        yaw = torch.zeros((1, ))
-        wrench_head_goal_quat_local = torch_jit_utils.quat_mul(
-            self.wrench_head_goal_quat_local.clone(),
-            torch_jit_utils.quat_from_euler_xyz(roll, pitch, yaw)
-        )
-        for i in range(int(total_deg/delta_deg)):
-            # current nut pose in robot base
-            nut_pos, nut_quat = self.get_standard_nut_pose()
-            # wrench head goal pose in robot base
-            wrench_head_goal_quat, wrench_head_goal_pos = torch_jit_utils.tf_combine(
-                nut_quat,
-                nut_pos,
-                wrench_head_goal_quat_local,
+        wrench_head_goal_pos_local[:, 2] += z_offset  # Adjust along the nut's z-axis
+
+        # Initial orientation without any rotation
+        initial_wrench_head_quat_local = self.wrench_head_goal_quat_local.clone()
+
+        for i in range(int(total_deg / delta_deg)):
+            # Calculate cumulative rotation angle relative to initial frame
+            current_deg = (i + 1) * delta_deg  # Total rotation so far
+            if not counter_clockwise:
+                current_deg = -current_deg
+
+            # Create rotation quaternion for the cumulative angle (around nut's z-axis)
+            roll = torch.tensor([current_deg * torch.pi / 180.0])
+            pitch = torch.tensor([0.0])
+            yaw = torch.tensor([0.0])
+            delta_quat = torch_jit_utils.quat_from_euler_xyz(roll, pitch, yaw)
+
+            # Apply cumulative rotation to initial wrench orientation
+            wrench_head_quat_local = torch_jit_utils.quat_mul(
+                initial_wrench_head_quat_local,
+                delta_quat
+            )
+
+            # Compute goal pose in base frame using initial nut pose
+            wrench_head_quat, wrench_head_pos = torch_jit_utils.tf_combine(
+                initial_nut_quat,
+                initial_nut_pos,
+                wrench_head_quat_local,
                 wrench_head_goal_pos_local
             )
-            # fingertip goal pose in robot base
-            fingertip_goal_quat, fingertip_goal_pos = self.wrench_head_to_fingertip(wrench_head_goal_quat, wrench_head_goal_pos)
-            # Move gripper to the goal pose
-            fingertip_goal_pose = torch.cat([fingertip_goal_pos, fingertip_goal_quat], axis=-1)
-            self.robot.move_fingertip(fingertip_goal_pose.numpy()[0], timeout=timeout)
 
-    def lift_wrench_head(self):
+            # Convert to fingertip pose and execute
+            fingertip_quat, fingertip_pos = self.wrench_head_to_fingertip(wrench_head_quat, wrench_head_pos)
+            fingertip_pose = torch.cat([fingertip_pos, fingertip_quat], axis=-1)
+            self.robot.move_fingertip(fingertip_pose.numpy()[0], timeout=timeout)
+
+    def lift_wrench_head_recover(self, num_steps: int=25, update_progress: bool=False):
+        # actions = torch.tensor([[0.0, 0.0, -1.0, 0.0, 0.0, 0.0]])
+        # for _ in range(10):
+        #     self.step(actions, update_progress=update_progress)
         actions = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
-        for _ in range(25):
-            self.step(actions, update_progress=False)
+        for _ in range(num_steps):
+            self.step(actions, update_progress=update_progress)
+            # self.apply_object_actions_as_ctrl_targets(actions, do_scale=True, regularize_with_force=True)
+    def lift_wrench_head(self, num_steps: int = 25, update_progress: bool = False):
+        # Get stationary nut's frame once at start
+        nut_pos, nut_quat = self.get_standard_nut_pose()
+
+        wrench_pos, wrench_quat = self.get_wrench_head_pose()
+        
+        # Extract nut's Z-axis in world coordinates
+        rot_matrix = torch_jit_utils.quaternion_to_matrix(nut_quat[..., [3, 0, 1, 2]])
+        nut_z_axis = rot_matrix[..., 2]  # Third column is Z-axis (1, 3)
+
+        # Initial downward movement to disengage threads
+        self.step(torch.tensor([[0.0, 0.0, -1.0, 0.0, 0.0, 0.0]]), update_progress)
+
+        # Main lifting sequence
+        # for _ in range(num_steps):
+        while wrench_pos[:, 2] - nut_pos[:, 2] < 0.03:
+            # 1. Get current wrench head orientation
+            wrench_pos, wrench_quat = self.get_wrench_head_pose()
+            
+            # 2. Calculate desired direction in wrench's local frame
+            inv_wrench_rot = torch_jit_utils.quat_conjugate(wrench_quat)
+            lift_dir_local = torch_jit_utils.quat_apply(inv_wrench_rot, nut_z_axis)
+            
+            # 3. Create normalized movement command
+            action_translation = lift_dir_local / torch.norm(lift_dir_local)
+            action = torch.cat([action_translation, torch.zeros(3).repeat((action_translation.size(0), 1))], dim=-1)
+            # ic(action[:, :3])
+            
+            # 4. Execute with smaller steps
+            # self.step(action, update_progress)
+            self.apply_object_actions_as_ctrl_targets(action, do_scale=True, regularize_with_force=True)
 
     ## Transformation Functions ##
     def wrench_head_to_fingertip(self, wrench_head_goal_quat: torch.Tensor, wrench_head_goal_pos: torch.Tensor):
@@ -640,14 +779,13 @@ if __name__ == "__main__":
     env.wait_for_subscribers(seconds=10)
     
     obs = env.reset()
-    input("Press Enter to continue rotating...")
-    env.rotate_wrench_head_on_nut()
     input("Press Enter to continue inserting...")
     is_done = False
     while not is_done:
-        actions = torch.tensor([[0.0, -1.0, 0.0, 0.0, 0.0, 0.0]])
+        actions = torch.tensor([[0.0, 0.0, 0.0, 0.0, -1.0, 0.0]])
         obs, is_done = env.step(actions)
 
+        """
         nut_pos, nut_quat = env.get_standard_nut_pose()
         wrench_head_quat, wrench_head_pos = torch_jit_utils.tf_combine(
             nut_quat,
@@ -666,3 +804,4 @@ if __name__ == "__main__":
         vis = env.draw_poses_in_base(vis, torch.cat([wrench_head_goal_pos, wrench_head_goal_quat], dim=1), draw_bbox=False)
         # cv2.imshow("vis", vis[::-1, ::-1, ::-1])
         # cv2.waitKey(1)
+        """

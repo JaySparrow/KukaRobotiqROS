@@ -184,10 +184,10 @@ if __name__ == "__main__":
     import cv2
     rospy.init_node("pose_tracker_ros_publisher", anonymous=False)
     # object_names = ["nut5", "wrench5", "wrench5_head"]
-    object_names = ["nut4", "wrench4", "wrench4_head"]
+    # object_names = ["nut4", "wrench4", "wrench4_head"]
     # object_names = ["nut3", "wrench3", "wrench3_head"]
     # object_names = ["nut2", "wrench2", "wrench2_head"]
-    # object_names = ["nut1", "wrench1", "wrench1_head"]
+    object_names = ["nut1", "wrench1", "wrench1_head"]
     cam_T_base = np.loadtxt("/home/robotics/kuka_workspace/Kuka_Basics/melodic/src/kuka_utils/tutorial/nodes/KukaRobotiqROS/Vision/cam_T_base.txt")
     pose_tracker = PoseTrackerRosPublisher(object_names, cam_T_base, server_ip="172.16.71.27")
     pose_tracker.run()
